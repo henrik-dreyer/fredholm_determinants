@@ -1,6 +1,28 @@
 import numpy as np
 from scipy.integrate import simpson
 
+'''Helper Functions for XY model'''
+def theta(h,gamma,k):
+  if h=='inf':
+    out = np.zeros(len(k))
+  else:
+    out = -1j*np.log(h-np.exp(1j*k) / (np.sqrt( 1+h**2-2*h*np.cos(k) )))
+  return out
+
+def K(hbar, gammabar, h, gamma, k):
+    out = np.tan( (theta(hbar,gammabar,k) - theta(h,gamma,k)) /2 )
+    return out
+
+
+'''Helper Functions for Ising model'''
+def eps(h, k):
+  #CAREFUL IN RAMOND SECTOR: TREAT k=0 SEPARATELY
+  if h=='inf':
+    out = 2. * np.ones(len(k))
+  else:
+    out = 2. * np.sqrt( 1. + h**2 - 2.*h*np.cos(k) )
+  return out
+
 
 '''Helper Functions for M(lambda, mu) = J'''
 
@@ -171,3 +193,174 @@ class CoherentState():
         m = np.real((m1 + m2) / 2)
 
         return m
+
+
+    def corr_func(self):
+        """
+        TODO: equation (59) in xy_field.pdf
+        self should be of h-type
+
+        """
+
+
+
+class SparseState(CoherentState):
+
+    """
+    This class provides basic functionality to propagate f(k).
+    It is Sparse because f is only tracked in the NS+ sector, allowing
+    for faster computation and training.
+    Fredholm determinants can *not* be computed.
+    Only the Ising submodel is implemented (corresponds to gamma = 1 in parent)
+
+
+    Parameters
+    ----------
+    model_params : dict
+        A dictionary with all the model parameters.
+        L: (Integer) System size. Only tested with even L
+        f_initial: Callable function f(k) to initialise the coherent state
+        h: Initial magnetic field. Default h='inf', corresponding to state |++...>
+
+
+    Attributes
+    ----------
+    L : (Integer) System Size
+    h : (Float) Current basis of f.
+    NS_plus : (Numpy Array) k-Grid with points pi/L * [1,3,5,..L-1]
+    """
+
+    def __init__(self,model_params):
+        self.f_initial = model_params.get('f_initial', lambda x: x*0)
+        self.h = 'inf'
+        self.L = model_params.get('L', 4)
+        self.NS_plus=np.arange(1, self.L, 2)*np.pi/self.L
+
+        if callable(self.f_initial):
+            self.fk = self.f_initial(self.NS_plus)
+
+
+    def change_basis(self, h_target):
+        """
+        changes h and f(k) in-place according to
+        cf. equation (A15) in https://arxiv.org/pdf/2104.01168.pdf
+
+        Parameters
+        ----------
+        h0: float initial transverse field
+        h1: float final transverse field
+        """
+        K_val = K(h_target, 1, self.h, 1, self.NS_plus)
+        self.fk = ( 1j * K_val + self.fk ) /  ( 1 + 1j * K_val * self.fk )
+        self.h = h_target
+
+
+    def eigenstate_evolve(self, t):
+        """
+        changes f(k) in-place according to
+        equation (A23) in https://arxiv.org/pdf/2104.01168.pdf
+
+        Parameters
+        ----------
+        t: float time
+        """
+        self.fk = np.exp(-2*t*1j*eps(self.h, self.NS_plus)) * self.fk
+
+
+    def set_Ck(self):
+        """
+        Sets correlation matrix in momentum space (diagonal)
+        C_k = <f| a^\dagger_k a_k  |f>
+        cf. equation (28) in xyfield12.pdf
+
+        Parameters
+        ----------
+        """
+        self.Ck = np.abs(self.fk) ** 2 / ( 1 + np.abs(self.fk)**2 )
+
+    def set_Fk(self):
+        """
+        Sets *anomalous* correlation matrix in momentum space (diagonal)
+        F_k = <f| a_k a_{-k}  |f>
+        cf. equation (28) in xyfield12.pdf
+        Note: This is the *complex conjugate* of https://arxiv.org/pdf/0906.1663.pdf
+        ~ eq (17)
+
+        Parameters
+        ----------
+        """
+        self.Fk = self.fk / ( 1 + np.abs(self.fk)**2 )
+
+
+
+    def set_Cxy_Fxy(self):
+        """
+        Sets fourier transformed correlation matrix in real space.
+        Note momentum sum runs over both NS+ and NS-.
+        We use f(k) = -f(-k)
+        C_xy = 1/L * sum_{k \in NS} exp(-ik (x-y))
+
+        Parameters
+        ----------
+
+        """
+        x = np.arange(self.L)
+        NS = np.append(self.NS_plus,-1*self.NS_plus)
+        Wxk = np.exp(-1j*np.outer(x,NS))
+        Ckk = np.diag(np.append(self.Ck,self.Ck))
+        Fkk = np.diag(np.append(self.Fk,-1*self.Fk))
+        self.Cxy = 1 / self.L * Wxk.dot( Ckk.dot(Wxk.conj().T))
+        self.Fxy = 1 / self.L * Wxk.dot( Fkk.dot(Wxk.conj().T))
+
+    def trace_out(self, sites):
+        """
+        Removes rows and columns from real space correlation matrices
+        Cxy and Fxy in-place. Sets Majorana modes
+            M = <a_m a_n>
+        where
+            a_{2n-1} = c_n + c_n^\dagger    [EVEN]
+            a_{2n} = i(c_n - c_n^\dagger)     [ODD]
+
+
+        Parameters
+        ----------
+        sites: (List of Integers) The sites to be traces out (complement remains)
+        """
+
+        l = self.L - len(sites)
+        self.Cxy=np.delete(self.Cxy, sites, axis=0)
+        self.Cxy=np.delete(self.Cxy, sites, axis=1)
+        self.Fxy=np.delete(self.Fxy, sites, axis=0)
+        self.Fxy=np.delete(self.Fxy, sites, axis=1)
+
+        self.iGamma = np.zeros((2*l, 2*l),dtype=complex)
+
+        #odd first, then even
+        self.iGamma[0:l, 0:l] = self.Cxy - self.Cxy.T - self.Fxy - self.Fxy.conj().T
+        self.iGamma[l:2*l, l:2*l] = self.Cxy - self.Cxy.T + self.Fxy + self.Fxy.conj().T
+        self.iGamma[0:l, l:2*l] = 1j*(self.Fxy - self.Cxy - self.Cxy.T - self.Fxy.conj().T + np.eye(l))
+        self.iGamma[l:2*l, 0:l] = 1j*(self.Fxy + self.Cxy + self.Cxy.T - self.Fxy.conj().T - np.eye(l))
+
+        #Permuting rows and columns does not change the eigenvalues
+        perm=0
+        if perm==True:
+            a = np.arange(0,l)
+            b = np.arange(l,2*l)
+            c = np.zeros((a.size + b.size,), dtype=a.dtype)
+            c[0::2] = a
+            c[1::2] = b
+
+            idx = np.empty_like(c)
+            idx[c] = np.arange(len(c))
+            self.M = self.M[:, idx]  # return a rearranged copy
+            self.M = self.M[idx, :]/2
+
+        self.iGamma = self.iGamma
+
+        self.eigvals=np.sort(np.linalg.eigh(self.iGamma)[0])[::-1]
+        self.eigvals = self.eigvals[0:self.eigvals.shape[0]//2]
+        self.epsl = np.arctanh(self.eigvals)*2
+
+        #TODO: Set up entropy from epsilon l
+        #M = np.transpose(M, c, axis=0)
+        #M = np.transpose(M, c, axis=1)
